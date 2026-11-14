@@ -20,7 +20,7 @@ use crate::config::{
     ini_graphics_size, parse_system_ini, IniFile, IniValue, TextLang, TEXT_FIELD_SEPARATOR,
 };
 use crate::effect::PalEffectSystem;
-use crate::font::{PalFontProfile, PalFontSystem, SIMHEI_SUBSTITUTE_CANDIDATES};
+use crate::font::{host_font_candidates, PalFontProfile, PalFontSystem, SIMHEI_SUBSTITUTE_CANDIDATES};
 use crate::image::{decode_image, decode_image_with_resolver, DecodedImage};
 use crate::input::{PalInputState, PalKey, PalMouseButton};
 use crate::msprite::{MSpriteHandle, MSpriteSystem, MSPRITE_STATE_FINISHED};
@@ -1782,9 +1782,7 @@ impl ScriptRuntime {
     pub fn apply_translation_font_policy(&mut self) {
         self.font_state.set_outline_text_only(true);
         if self.loaded_face_path.is_none() {
-            let face = SIMHEI_SUBSTITUTE_CANDIDATES
-                .iter()
-                .map(PathBuf::from)
+            let face = host_font_candidates(SIMHEI_SUBSTITUTE_CANDIDATES)
                 .find(|path| pal_asset::vfs::is_file(path));
             if face.is_none() {
                 log::warn!(

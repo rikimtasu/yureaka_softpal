@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import time
 import os
+from portable_config import engine_path, resolve_path
 
 ROOT = Path(__file__).resolve().parents[1]
 USER = ctypes.WinDLL("user32", use_last_error=True)
@@ -30,14 +31,14 @@ def main():
     parser.add_argument("game", type=Path)
     parser.add_argument("--render-scale", type=int, default=2, choices=range(1, 5))
     args = parser.parse_args()
-    game = args.game.resolve(strict=True)
+    game = resolve_path(str(args.game)).resolve(strict=True)
     if ROOT / "work" not in game.parents or game.name == "game-copy":
         raise ValueError("Use an isolated diagnostic root, not the player resource copy")
     title = "Yureaka display option check"
     log = game / "display-toggle.log"
     with log.open("wb") as stream:
         process = subprocess.Popen([
-            str(ROOT / "engine/target/release/sena.exe"), str(game),
+            str(engine_path()), str(game),
             "--no-audio", "--title", title, "--width", "1280", "--height", "720",
             "--physical-window-size", "--ignore-config-window-size",
             "--borderless-fullscreen", "--render-scale", str(args.render_scale),

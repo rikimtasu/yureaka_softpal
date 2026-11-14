@@ -4,20 +4,30 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 . "$PSScriptRoot/font-catalog.ps1"
 . "$PSScriptRoot/display-options.ps1"
+. "$PSScriptRoot/portable-config.ps1"
 $root = Split-Path $PSScriptRoot -Parent
-$path = "$root/yureaka.local.json"
-if (-not (Test-Path $path)) { throw 'Run scripts/prepare.py with your game directory first.' }
-$config = Get-Content $path -Raw | ConvertFrom-Json
-$borderlessDefault = if ($null -eq $config.PSObject.Properties['borderless_fullscreen']) { $true } else { [bool]$config.borderless_fullscreen }
-$integerDefault = if ($null -eq $config.PSObject.Properties['integer_scaling']) { $true } else { [bool]$config.integer_scaling }
-$config | Add-Member -NotePropertyName borderless_fullscreen -NotePropertyValue $borderlessDefault -Force
-$config | Add-Member -NotePropertyName integer_scaling -NotePropertyValue $integerDefault -Force
-$renderScale = if ($null -eq $config.PSObject.Properties['render_scale']) { 2 } else { [Math]::Clamp([int]$config.render_scale, 1, 4) }
-$config | Add-Member -NotePropertyName render_scale -NotePropertyValue $renderScale -Force
-$config | Add-Member -NotePropertyName debug_mode -NotePropertyValue ([bool]$config.debug_mode) -Force
+$config = Get-PortConfig $root
+if (-not $CheckControls) {
+    try { $null = Get-PortEngine $root }
+    catch {
+        if (-not (Test-Path -LiteralPath "$root/engine/Cargo.toml")) { throw }
+        $answer = [Windows.Forms.MessageBox]::Show(
+            'This source checkout needs to build the engine first. Rust, MSVC C++ build tools and the Windows SDK must already be installed. Build now? To play without these tools, use the portable ZIP.',
+            'Engine missing', 'YesNo', 'Question')
+        if ($answer -ne 'Yes') { return }
+        & "$PSScriptRoot/build.ps1"
+        $null = Get-PortEngine $root
+    }
+    try { $null = Get-PortGame $root $config.game_root }
+    catch {
+        & "$PSScriptRoot/setup.ps1"
+        $config = Get-PortConfig $root
+        try { $null = Get-PortGame $root $config.game_root } catch { return }
+    }
+}
 $form = New-Object Windows.Forms.Form
 $form.Text = 'Yureaka HD - Font and display'
-$form.ClientSize = New-Object Drawing.Size(620, 380)
+$form.ClientSize = New-Object Drawing.Size(620, 420)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -30,7 +40,7 @@ $fonts.DropDownStyle = 'DropDownList'
 $fonts.DisplayMember = 'Name'
 $fonts.ValueMember = 'Path'
 [void]$fonts.Items.Add([pscustomobject]@{ Name = 'Original bitmap font'; Path = '' })
-$fontDirs = @("$env:WINDIR/Fonts", "$env:LOCALAPPDATA/Microsoft/Windows/Fonts")
+$fontDirs = @("$root/fonts", "$env:WINDIR/Fonts", "$env:LOCALAPPDATA/Microsoft/Windows/Fonts")
 foreach ($dir in $fontDirs) {
     if (Test-Path $dir) {
         Get-ChildItem $dir -File | Where-Object { $_.Extension -in '.ttf', '.otf', '.ttc' } | Sort-Object Name | ForEach-Object {
@@ -38,7 +48,7 @@ foreach ($dir in $fontDirs) {
         }
     }
 }
-Select-FontPath $fonts $config.font_file
+Select-FontPath $fonts (Resolve-PortPath $root $config.font_file)
 $fontPathLabel = New-Object Windows.Forms.Label
 $fontPathLabel.SetBounds(15, 75, 590, 22)
 $fontPathLabel.AutoEllipsis = $true
@@ -91,9 +101,19 @@ $debugMode = New-Object Windows.Forms.CheckBox
 $debugMode.Text = 'Port debug logging (not the original developer menu)'
 $debugMode.SetBounds(15, 275, 590, 30)
 $debugMode.Checked = $config.debug_mode
+$setup = New-Object Windows.Forms.Button
+$setup.Text = 'Set up another game copy...'
+$setup.SetBounds(15, 320, 260, 30)
+$setup.Add_Click({
+    try {
+        & "$PSScriptRoot/setup.ps1" -Destination ('work/game-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fffffff'))
+        $updated = Get-PortConfig $root
+        $config.game_root = $updated.game_root
+    } catch { [void][Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Setup failed') }
+})
 $start = New-Object Windows.Forms.Button
 $start.Text = 'Play'
-$start.SetBounds(510, 335, 95, 30)
+$start.SetBounds(510, 375, 95, 30)
 $start.Add_Click({
     $font = $fonts.SelectedItem.Path
     if ($font -and -not (Test-Path -LiteralPath $font -PathType Leaf)) {
@@ -107,11 +127,12 @@ $start.Add_Click({
     $config.integer_scaling = $integer.Checked
     $config.render_scale = $scale.SelectedIndex + 1
     $config.debug_mode = $debugMode.Checked
-    $config | ConvertTo-Json | Set-Content $path -Encoding utf8
+    try { Save-PortConfig $root $config }
+    catch { [void][Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Cannot save settings'); return }
     $form.DialogResult = 'OK'
     $form.Close()
 })
-$form.Controls.AddRange(@($label, $fonts, $browse, $fontPathLabel, $resolutionLabel, $resolution, $modeLabel, $displayMode, $integer, $scale, $note, $debugMode, $start))
+$form.Controls.AddRange(@($label, $fonts, $browse, $fontPathLabel, $resolutionLabel, $resolution, $modeLabel, $displayMode, $integer, $scale, $note, $debugMode, $setup, $start))
 $form.AcceptButton = $start
 if ($CheckControls) {
     $displayMode.SelectedIndex = 0

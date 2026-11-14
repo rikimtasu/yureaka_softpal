@@ -13,16 +13,15 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$config = Get-Content "$root/yureaka.local.json" -Raw | ConvertFrom-Json
-$game = [IO.Path]::GetFullPath($(if ($GameRoot) { $GameRoot } else { $config.game_root }))
-# Only run against a workspace-owned resource copy. Never fall back to the installation.
-$work = [IO.Path]::GetFullPath("$root/work/")
-if (-not $game.StartsWith($work, [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'game_root must be inside this workspace/work directory. Run scripts/prepare.py first.'
-}
-$exe = "$root/engine/target/release/sena.exe"
-if (-not (Test-Path $exe)) { throw 'Build first: pwsh -File scripts/build.ps1' }
-if (-not $FontFile) { $FontFile = $config.font_file }
+. "$PSScriptRoot/portable-config.ps1"
+$config = Get-PortConfig $root
+$game = Get-PortGame $root $(if ($GameRoot) { $GameRoot } else { $config.game_root })
+$work = Resolve-PortPath $root 'work'
+$exe = Get-PortEngine $root
+if (-not $PSBoundParameters.ContainsKey('Width')) { $Width = [int]$config.width }
+if (-not $PSBoundParameters.ContainsKey('Height')) { $Height = [int]$config.height }
+if (-not $PSBoundParameters.ContainsKey('FontFile')) { $FontFile = $config.font_file }
+$FontFile = Resolve-PortPath $root $FontFile
 if (-not $FontFile) { $OriginalFont = $true }
 $engineOptions = @($game, '--nls', 'sjis', '--title', 'Yureaka HD',
     '--width', "$Width", '--height', "$Height", '--ignore-config-window-size', '--physical-window-size')
@@ -38,7 +37,10 @@ if (-not $Windowed -and ($BorderlessFullscreen -or $config.borderless_fullscreen
 }
 $useScaling = if ($PSBoundParameters.ContainsKey('IntegerScaling')) { [bool]$IntegerScaling } elseif ($null -eq $config.PSObject.Properties['integer_scaling']) { $true } else { [bool]$config.integer_scaling }
 if (-not $PSBoundParameters.ContainsKey('RenderScale') -and $null -ne $config.PSObject.Properties['render_scale']) { $RenderScale = [int]$config.render_scale }
-if ($useScaling -and $RenderScale -gt 0) { $engineOptions += @('--render-scale', "$RenderScale") }
+if ($useScaling) {
+    $engineOptions += '--integer-scaling'
+    if ($RenderScale -gt 0) { $engineOptions += @('--render-scale', "$RenderScale") }
+}
 $useDebug = if ($PSBoundParameters.ContainsKey('DebugMode')) { [bool]$DebugMode } else { [bool]$config.debug_mode }
 Push-Location $root
 try {

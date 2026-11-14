@@ -1,12 +1,12 @@
 """Replay a selected save in an isolated resource root for sprite diagnostics."""
 import argparse
 from datetime import datetime
-import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+from portable_config import load_config, game_path, font_options, engine_path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,10 +50,8 @@ def main():
     if args.check_existing:
         verify_reported_scenes(args.check_existing)
         return
-    config = json.loads((ROOT / "yureaka.local.json").read_text(encoding="utf-8-sig"))
-    source = Path(config["game_root"]).resolve(strict=True)
-    if ROOT / "work" not in source.parents:
-        raise ValueError("Validation must use workspace-owned resources")
+    config = load_config()
+    source = game_path(config)
     game = ROOT / "work" / ("sprite-display-check-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
     game.mkdir()
     for file in source.rglob("*"):
@@ -68,7 +66,7 @@ def main():
             os.link(file, target)
     x = 200 + 320 * (args.slot % 3)
     y = 200 + 129 * (args.slot // 3)
-    options = [str(ROOT / "engine/target/release/sena.exe"), str(game),
+    options = [str(engine_path()), str(game),
                "--no-audio", "--trace-assets",
                "--diagnostic-device-size", "1920x1080", "--diagnostic-frames", str(args.frames),
                "--diagnostic-click", "3000:280:250",
@@ -82,8 +80,7 @@ def main():
         options = ["--window-dump-frame-at" if item == "--diagnostic-png-at" else item for item in options]
     else:
         options += ["--headless"]
-    if config.get("font_file"):
-        options += ["--font-file", config["font_file"]]
+    options += font_options(config)
     if args.integer_scaling:
         options += ["--integer-scaling"]
     if args.render_scale:

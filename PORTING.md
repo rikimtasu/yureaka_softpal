@@ -63,3 +63,20 @@ cargo run --locked --release -p pal-vm --example bench_audio_load -- ../work/gam
 ```
 
 Both probes use the same local resource copy and Shift-JIS lookup. Audio decoding runs with the device disabled. The image probe reports uncached decoding separately from first and repeated loads through the cache. The sprite baseline is `work/pgd-check-current.log`. The voice baseline is `work/audio-load-before.log`; it used the same probe before the single-pass decoder and cache changes. Fully decoded, non-streaming audio is what this section calls static audio.
+
+## Portable Windows setup (2026-11-14)
+
+`scripts/portable-config.ps1` resolves paths relative to the port folder. Settings store game roots under `work/`, local custom fonts under `fonts/`, and installed fonts with `%WINDIR%` or `%LOCALAPPDATA%` tokens. Earlier setup versions wrote absolute game paths. After moving a folder with those settings, the reader automatically tries the portion starting at `work/` inside the new port folder and uses it if that directory exists. Missing installed fonts fall back to MS Gothic or bitmap text.
+
+`scripts/setup.ps1` uses a folder picker when no installation is supplied. It copies resources to a new workspace-owned directory and excludes original saves. Validation rejects symlinks and NTFS junctions in input files/directories and their parents, and rejects overlapping source/destination directories before copying. Files are copied as bytes, not hardlinked. Repeated setup preserves existing copies. The Python setup alternative also writes a relative game root; developer replay scripts resolve that format.
+
+The `.cmd` launchers use PowerShell 7 if available, otherwise Windows PowerShell 5.1. A source checkout uses `engine/target/release/sena.exe`; a player ZIP uses `bin/sena.exe`. `scripts/build.ps1` requests static CRT linkage, and `scripts/package.ps1` packages the engine and runtime scripts without local game resources, custom fonts or settings.
+
+Focused checks:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File scripts/test-portable.ps1
+python scripts/test_prepare.py
+```
+
+The PowerShell check uses synthetic resources and an argument-recording executable. It covers resource-copy independence, save exclusion, missing DLLs, linked inputs, custom-font copying, moving a folder with spaces and Japanese characters, legacy-path recovery, and launcher controls without a settings file. It does not establish gameplay compatibility on another PC. Full-route and audio validation remain outstanding.

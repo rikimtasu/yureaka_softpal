@@ -1,5 +1,7 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use pal_asset::Nls;
+use std::ffi::OsStr;
+use std::path::PathBuf;
 mod bitmap;
 mod native;
 mod raster;
@@ -565,7 +567,7 @@ impl PalFontFallback {
     /// Construct using the embedded default.ttf.  Panics only if the embedded file
     /// is corrupt (which would be a build-time error, not a runtime condition).
     pub fn default_ttf() -> Self {
-        for path in SYSTEM_CJK_FONT_CANDIDATES {
+        for path in host_font_candidates(SYSTEM_CJK_FONT_CANDIDATES) {
             let Ok(bytes) = std::fs::read(path) else {
                 continue;
             };
@@ -676,7 +678,7 @@ fn glyph_baseline_shift(min_y: i32, max_y: i32, ascent: f32, cell_height: f32) -
 /// forces on every text font (mai.dll 0x10004580, GB2312_CHARSET). Heiti
 /// faces come first; pan-CJK faces at least cover the simplified glyphs.
 pub const SIMHEI_SUBSTITUTE_CANDIDATES: &[&str] = &[
-    "C:/Windows/Fonts/simhei.ttf",
+    "%WINDIR%/Fonts/simhei.ttf",
     "/Library/Fonts/SimHei.ttf",
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/STHeiti Light.ttc",
@@ -695,9 +697,21 @@ const SYSTEM_CJK_FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "C:/Windows/Fonts/msyh.ttc",
-    "C:/Windows/Fonts/msgothic.ttc",
+    "%WINDIR%/Fonts/msyh.ttc",
+    "%WINDIR%/Fonts/msgothic.ttc",
 ];
+
+fn host_font_path(path: &str, windows_directory: Option<&OsStr>) -> Option<PathBuf> {
+    match path.strip_prefix("%WINDIR%/") {
+        Some(relative) => windows_directory.map(|root| PathBuf::from(root).join(relative)),
+        None => Some(PathBuf::from(path)),
+    }
+}
+
+pub(crate) fn host_font_candidates<'a>(candidates: &'a [&str]) -> impl Iterator<Item = PathBuf> + 'a {
+    let windows_directory = std::env::var_os("WINDIR");
+    candidates.iter().filter_map(move |path| host_font_path(path, windows_directory.as_deref()))
+}
 
 fn argb_to_rgba(color: u32) -> [u8; 4] {
     [
@@ -711,6 +725,16 @@ fn argb_to_rgba(color: u32) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_font_candidates_use_the_host_windows_directory() {
+        let windows = OsStr::new("E:/Windows");
+        assert_eq!(host_font_path("%WINDIR%/Fonts/msgothic.ttc", Some(windows)),
+            Some(PathBuf::from(windows).join("Fonts/msgothic.ttc")));
+        assert_eq!(host_font_path("%WINDIR%/Fonts/msgothic.ttc", None), None);
+        assert_eq!(host_font_path("/Library/Fonts/SimHei.ttf", None),
+            Some(PathBuf::from("/Library/Fonts/SimHei.ttf")));
+    }
 
     #[test]
     fn explicit_outline_policy_survives_script_bitmap_type_and_reload() {

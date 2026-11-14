@@ -1,26 +1,27 @@
 """Run independent font and letterbox checks against the private resource copy."""
-import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from portable_config import load_config, game_path, resolve_path, engine_path
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    config = json.loads((ROOT / "yureaka.local.json").read_text(encoding="utf-8-sig"))
-    source = Path(config["game_root"]).resolve(strict=True)
-    if ROOT / "work" not in source.parents:
-        raise ValueError("Validation must use the private resource copy")
+    config = load_config()
+    source = game_path(config)
     for tag, font, size, extra in [
-        ("mincho", "C:/Windows/Fonts/msmincho.ttc", "1920x1080", []),
-        ("letterbox", "C:/Windows/Fonts/msgothic.ttc", "1920x1200", []),
-        ("backlog", "C:/Windows/Fonts/msgothic.ttc", "1920x1080", ["--diagnostic-wheel", "9100:1"]),
-        ("menu", "C:/Windows/Fonts/msgothic.ttc", "1920x1080", ["--diagnostic-click", "9100:1250:700"]),
+        ("mincho", "%WINDIR%/Fonts/msmincho.ttc", "1920x1080", []),
+        ("letterbox", "%WINDIR%/Fonts/msgothic.ttc", "1920x1200", []),
+        ("backlog", "%WINDIR%/Fonts/msgothic.ttc", "1920x1080", ["--diagnostic-wheel", "9100:1"]),
+        ("menu", "%WINDIR%/Fonts/msgothic.ttc", "1920x1080", ["--diagnostic-click", "9100:1250:700"]),
     ]:
         if len(sys.argv) > 1 and tag not in sys.argv[1:]:
             continue
+        font = resolve_path(font)
+        if not font.is_file():
+            raise FileNotFoundError(f"Install a Japanese font before running this font comparison: {font}")
         game = ROOT / "work" / f"smoke-{tag}"
         suffix = 2
         while game.exists():
@@ -35,8 +36,8 @@ def main():
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.link(file, dest)  # Both endpoints are workspace-owned copies.
         (game / "save").mkdir()
-        options = [str(ROOT / "engine/target/release/sena.exe"), str(game),
-                   "--headless", "--no-audio", "--font-file", font,
+        options = [str(engine_path()), str(game),
+                   "--headless", "--no-audio", "--font-file", str(font),
                    "--diagnostic-device-size", size, "--diagnostic-frames", "9200",
                    "--diagnostic-click", "3000:280:184",
                    "--diagnostic-png-at", f"8999:work/diag/{tag}-adv.png",

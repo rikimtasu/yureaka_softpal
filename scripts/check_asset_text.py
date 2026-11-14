@@ -1,20 +1,18 @@
 """Replay the copied save with the selected font without touching player saves."""
-import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 from datetime import datetime
+from portable_config import load_config, game_path, font_options, engine_path
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    config = json.loads((ROOT / "yureaka.local.json").read_text(encoding="utf-8-sig"))
-    source = Path(config["game_root"]).resolve(strict=True)
-    if ROOT / "work" not in source.parents:
-        raise ValueError("Validation must use workspace-owned game resources")
+    config = load_config()
+    source = game_path(config)
     game = ROOT / "work" / ("asset-text-check-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
     game.mkdir()
     for file in source.rglob("*"):
@@ -27,8 +25,8 @@ def main():
             shutil.copy2(file, target)
         else:
             os.link(file, target)
-    options = [str(ROOT / "engine/target/release/sena.exe"), str(game),
-               "--headless", "--no-audio", "--font-file", config["font_file"],
+    options = [str(engine_path()), str(game), *font_options(config),
+               "--headless", "--no-audio",
                "--diagnostic-device-size", "1920x1080", "--diagnostic-frames", "7600",
                "--diagnostic-click", "3000:280:250",
                "--diagnostic-png-at", f"3300:{game / 'load-menu.png'}",
