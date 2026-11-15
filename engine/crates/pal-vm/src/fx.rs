@@ -42,7 +42,7 @@ impl RasterUniforms {
                 return 0.0;
             }
             let angle =
-                (coordinate * 180.0 + 360.0 * (1.0 - amount) * phase) * 3.141592 / denominator;
+                (coordinate * 180.0 + 360.0 * (1.0 - amount) * phase) * std::f32::consts::PI / denominator;
             angle.sin() * (0.1 * amount)
         }
         [

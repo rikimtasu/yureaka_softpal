@@ -9,7 +9,7 @@ pub struct PointTable {
 
 impl PointTable {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             return Err(PalError::PointTableMisaligned { len: bytes.len() });
         }
         let mut offsets = Vec::with_capacity(bytes.len() / 4);

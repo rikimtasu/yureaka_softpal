@@ -2104,7 +2104,7 @@ fn wmv2_mspel8_v_lowpass(
         let s8 = src[so + 8 * src_stride] as i32;
         let s9 = src[so + 9 * src_stride] as i32;
 
-        let do0 = dst_off + i + 0 * dst_stride;
+        let do0 = dst_off + i;
         let do1 = dst_off + i + dst_stride;
         let do2 = dst_off + i + 2 * dst_stride;
         let do3 = dst_off + i + 3 * dst_stride;

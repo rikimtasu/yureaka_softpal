@@ -1,0 +1,68 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: fmt / clippy / test
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (clippy + fmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      # Legacy formatting debt (1.6k diffs across vendored decoders). This step
+      # is informational until `cargo fmt` is run once over the workspace.
+      - name: rustfmt (informational)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # First-party crates are warning-free: fail on any warning.
+      - name: clippy (first-party, -D warnings)
+        run: cargo clippy --locked --release -p pal-asset -p pal-script -p pal-disassembled -- -D warnings
+
+      # pal-vm still carries ~119 low-severity warnings (mostly generated-table
+      # noise). Deny-by-default lints (erasing_op, approx_constant,
+      # not_unsafe_ptr_arg_deref) still fail the build; warnings are allowed.
+      - name: clippy pal-vm (deny lints fail)
+        run: cargo clippy --locked --release -p pal-vm
+
+      - name: cargo test (pal-vm + pal-asset + pal-script + pal-disassembled)
+        run: cargo test --locked --release -p pal-vm -p pal-asset -p pal-script -p pal-disassembled
+
+      - name: ABI freshness
+        run: python reverse/abi/generate.py --check
+
+  portable-scripts:
+    name: portable setup checks (python)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: python setup tests
+        run: python scripts/test_prepare.py

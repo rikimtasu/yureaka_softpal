@@ -322,7 +322,7 @@ fn normalize_relative_path(path: &str) -> String {
 
 fn join_pal_path(base: &Path, pal_path: &str) -> PathBuf {
     let mut out = base.to_path_buf();
-    for part in pal_path.split(|c| c == '\\' || c == '/') {
+    for part in pal_path.split(['\\', '/']) {
         if part.is_empty() || part == "." {
             continue;
         }

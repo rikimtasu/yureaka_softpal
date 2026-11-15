@@ -235,8 +235,13 @@ fn mime_for_path(path: &Path) -> Option<&'static str> {
 }
 
 /// Releases strings returned by the Sena C ABI.
+///
+/// # Safety
+///
+/// `ptr` must be either null or an allocation previously returned by this
+/// crate's C ABI (via `CString::into_raw`). Passing any other pointer is UB.
 #[no_mangle]
-pub extern "C" fn sena_free_c_string(ptr: *mut c_char) {
+pub unsafe extern "C" fn sena_free_c_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {
             drop(CString::from_raw(ptr));
@@ -245,9 +250,13 @@ pub extern "C" fn sena_free_c_string(ptr: *mut c_char) {
 }
 
 /// Alias retained for the platform launcher headers.
+///
+/// # Safety
+///
+/// Same contract as `sena_free_c_string`.
 #[no_mangle]
-pub extern "C" fn sena_string_free(ptr: *mut c_char) {
-    sena_free_c_string(ptr);
+pub unsafe extern "C" fn sena_string_free(ptr: *mut c_char) {
+    unsafe { sena_free_c_string(ptr) };
 }
 
 /// Returns a display name for a game directory.

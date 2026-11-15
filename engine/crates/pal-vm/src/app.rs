@@ -171,6 +171,12 @@ pub fn run_sena(config: SenaConfig) -> anyhow::Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = SenaApplication::new(config)?;
     event_loop.run_app(&mut app)?;
+    // Window/renderer setup runs inside `resumed`, so its failure cannot be a
+    // `run_app` error. Surface it here so `run.ps1` / `launch.ps1` see a
+    // non-zero exit and can show the message instead of a panic.
+    if let Some(error) = app.startup_error.take() {
+        return Err(anyhow::anyhow!(error));
+    }
     Ok(())
 }
 
@@ -200,6 +206,23 @@ mod physical_window_tests {
     fn startup_fullscreen_uses_borderless_not_an_exclusive_video_mode() {
         assert!(matches!(initial_fullscreen(true), Some(Fullscreen::Borderless(None))));
         assert!(initial_fullscreen(false).is_none());
+    }
+
+    #[test]
+    fn only_halted_exits_the_interactive_window() {
+        let halted = RuntimeStatus::Halted { pc: 0 };
+        let unsupported = RuntimeStatus::UnsupportedCommand { pc: 0, opcode: 1, name: None };
+        let faulted = RuntimeStatus::Faulted { pc: 0, message: "boom".to_owned() };
+        let running = RuntimeStatus::Running { pc: 0 };
+        assert!(runtime_status_is_terminal(&halted));
+        assert!(!runtime_status_is_terminal(&unsupported));
+        assert!(!runtime_status_is_terminal(&faulted));
+        assert!(!runtime_status_is_terminal(&running));
+        // Headless/diagnostic runs stop on all three (no user to confirm).
+        assert!(runtime_status_is_fatal(&halted));
+        assert!(runtime_status_is_fatal(&unsupported));
+        assert!(runtime_status_is_fatal(&faulted));
+        assert!(!runtime_status_is_fatal(&running));
     }
 }
 
@@ -357,7 +380,9 @@ pub fn run_sena_headless(config: SenaConfig) -> anyhow::Result<()> {
                 );
             }
         }
-        let terminal = runtime_status_is_terminal(&frame.runtime_status);
+        // Headless and diagnostic runs have no user to confirm: stop early on
+        // any fatal status so supervisors see the fault promptly.
+        let terminal = runtime_status_is_fatal(&frame.runtime_status);
         last_frame = Some(frame);
         if terminal {
             eprintln!(
@@ -379,7 +404,17 @@ pub fn run_sena_headless(config: SenaConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Interactive auto-exit: only an explicit script halt (`Halted`) mirrors the
+/// native PAL exit. Unsupported commands/extcalls and faults must not kill a
+/// long session just because one op is unimplemented; they are logged once in
+/// `render` and the window stays open so the user can back out via the menu.
 fn runtime_status_is_terminal(status: &RuntimeStatus) -> bool {
+    matches!(status, RuntimeStatus::Halted { .. })
+}
+
+/// Headless/diagnostic early-stop: no user is present, so Unsupported/Faulted
+/// also stop the run (smoke/diagnose supervisors then report the fault).
+fn runtime_status_is_fatal(status: &RuntimeStatus) -> bool {
     matches!(
         status,
         RuntimeStatus::Halted { .. }
@@ -401,6 +436,12 @@ struct SenaApplication {
     next_redraw_at: Instant,
     fullscreen_override: Option<bool>,
     windowed_size: Option<PhysicalSize<u32>>,
+    /// Last frame status seen by interactive `render`, for once-per-change
+    /// logging of Unsupported/Faulted (which no longer auto-exit).
+    last_runtime_status: Option<RuntimeStatus>,
+    /// Window/renderer startup failure, surfaced as `run_sena`'s error so
+    /// `run.ps1`/`launch.ps1` can show it and exit non-zero.
+    startup_error: Option<String>,
 }
 
 impl SenaApplication {
@@ -423,6 +464,8 @@ impl SenaApplication {
             next_redraw_at: Instant::now(),
             fullscreen_override,
             windowed_size: None,
+            last_runtime_status: None,
+            startup_error: None,
         })
     }
 
@@ -446,9 +489,9 @@ impl SenaApplication {
             .map(|snapshot| snapshot.path.as_path())
     }
 
-    fn create_window_and_renderer(&mut self, event_loop: &ActiveEventLoop) {
+    fn create_window_and_renderer(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         if self.window.is_some() {
-            return;
+            return Ok(());
         }
         let (width, height) = if self.config.prefer_config_window_size {
             self.engine
@@ -463,7 +506,7 @@ impl SenaApplication {
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
-                .expect("sena failed to create a winit window"),
+                .map_err(|err| anyhow::anyhow!("failed to create the game window: {err}"))?,
         );
         let actual_size = window.inner_size();
         self.engine.handle_event(PalEvent::Resized {
@@ -478,11 +521,12 @@ impl SenaApplication {
             event_loop.owned_display_handle(),
             renderer_config,
         ))
-        .expect("sena failed to initialize the software renderer");
+        .map_err(|err| anyhow::anyhow!("failed to initialize the renderer: {err}"))?;
         self.window = Some(window);
         self.engine.set_host_gpu_renderer(renderer.uses_gpu());
         self.renderer = Some(renderer);
         self.observe_window_geometry();
+        Ok(())
     }
 
     fn observe_window_geometry(&mut self) {
@@ -748,7 +792,18 @@ impl SenaApplication {
             );
             self.engine.shutdown();
             event_loop.exit();
+            return;
         }
+        // Unsupported commands/extcalls and faults no longer exit: log once per
+        // change (not every frame) and keep the window open for the user.
+        let fatal = runtime_status_is_fatal(&frame.runtime_status);
+        if fatal && self.last_runtime_status.as_ref() != Some(&frame.runtime_status) {
+            log::error!(
+                "sena runtime hit a non-terminal stop ({}); the game window stays open. Use the in-game menu to exit.",
+                frame.runtime_status
+            );
+        }
+        self.last_runtime_status = Some(frame.runtime_status);
     }
 
     fn render_window_diagnostic_batch(&mut self, event_loop: &ActiveEventLoop) {
@@ -817,7 +872,8 @@ impl SenaApplication {
                 frame.scene.clear_color
             );
 
-            let terminal = runtime_status_is_terminal(&frame.runtime_status);
+            // Diagnostic batch has no user to confirm: stop on any fatal status.
+            let terminal = runtime_status_is_fatal(&frame.runtime_status);
             self.engine.input_begin_frame();
             self.diagnostic_frame_index = self.diagnostic_frame_index.saturating_add(1);
             if terminal {
@@ -1120,7 +1176,13 @@ fn write_scene_png(
 
 impl ApplicationHandler for SenaApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        self.create_window_and_renderer(event_loop);
+        if let Err(err) = self.create_window_and_renderer(event_loop) {
+            log::error!("sena startup failed: {err:#}");
+            eprintln!("Yureaka HD failed to start: {err:#}");
+            self.engine.shutdown();
+            self.startup_error = Some(format!("{err:#}"));
+            event_loop.exit();
+        }
     }
 
     fn window_event(
