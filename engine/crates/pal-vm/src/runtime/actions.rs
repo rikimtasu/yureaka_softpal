@@ -115,6 +115,23 @@ fn entry_kind(index: u16) -> Option<(u8, usize)> {
 }
 
 impl ScriptRuntime {
+    pub(super) fn rebind_sprite_actions(
+        &mut self,
+        sprites: &mut SpriteSystem,
+        from: SpriteHandle,
+        to: SpriteHandle,
+    ) {
+        // Expression replacement changes the PAL image, not the script's
+        // wrapper. Keep running sections, completed lanes and their clocks.
+        snapshot::remap(&mut self.action_state, &BTreeMap::from([(from, to)]), false);
+        if let Some(lanes) = sprites.get(from).map(|sprite| sprite.action_lanes) {
+            if let Some(sprite) = sprites.get_mut(to) {
+                sprite.action_lanes = lanes;
+            }
+        }
+        sprites.rebind_motion(from, to);
+    }
+
     /// A bank started by `action_sync_run` (mode 2) is still running.
     pub(super) fn action_sync_run_active(&self) -> bool {
         self.action_state.banks.iter().any(|bank| bank.mode == 2)
@@ -420,13 +437,21 @@ impl ScriptRuntime {
                 .flatten()
                 .collect();
         }
-        if let Some(handle) = self.packed_button_sprite_handle(slot) {
-            return vec![handle];
+        if Self::packed_button_key(slot).is_some() {
+            // A missing button must not fall through to an ordinary scene
+            // sprite with the same low index (or a different button group).
+            return self.packed_button_sprite_handle(slot).into_iter().collect();
         }
-        decode_pal_sprite_slot(slot)
-            .and_then(|(slot, _)| self.game_sprites.get(&slot).copied())
-            .into_iter()
-            .collect()
+        let handle = match decode_pal_sprite_slot(slot) {
+            Some((index, None)) => self.game_sprites.get(&index).copied(),
+            // Use the same UI namespace as direct encoded alpha setters.
+            // Dropping this tag makes dialogue fades reveal scene effects.
+            Some((index, Some(1))) => self.encoded_button_key(1, index)
+                .and_then(|key| self.game_buttons.get(&key))
+                .map(|entry| entry.handle),
+            _ => None,
+        };
+        handle.into_iter().collect()
     }
 
     fn start_action_section(
@@ -531,6 +556,7 @@ impl ScriptRuntime {
         mut sprites: Option<&mut SpriteSystem>,
     ) {
         if let Some(sprites) = sprites.as_deref_mut() {
+            let (logical_width, logical_height) = self.logical_size();
             for line in bank.lines.values_mut() {
                 for index in line.index..line.sections.len() {
                     let section = &line.sections[index];
@@ -555,18 +581,29 @@ impl ScriptRuntime {
                     // clearing the final block, despite accumulating it.
                     delta.position[2] = 0.0;
                     sprite.commit_action_lanes(delta);
-                    if delta.scale != 0.0 {
-                        // Expression swaps and later wrapper setters rebuild
-                        // scale from these lanes, not from the live PAL sprite.
-                        // Commit completed scale there too; temporary action
-                        // values must remain separate until the bank finishes.
-                        let raw_scale = factor_to_pal_scale(sprite.scale);
-                        for (&slot, &live) in &self.game_sprites {
-                            if live == handle {
+                    // Wrapper setters and expression swaps rebuild from these
+                    // cached bases. Commit all affected lanes there as well,
+                    // without baking transient animation into the base.
+                    for (&slot, &live) in &self.game_sprites {
+                        if live == handle {
+                            if delta.alpha != 0 {
+                                self.game_sprite_base_alpha.insert(slot, i32::from(sprite.color.alpha()));
+                            }
+                            if delta.scale != 0.0 {
+                                let raw_scale = factor_to_pal_scale(sprite.scale);
                                 self.game_sprite_native_scales.insert(slot, raw_scale);
                                 if let Some(visual) = self.game_sprite_wrapper_visuals.get_mut(&slot) {
                                     visual.raw_scale = raw_scale;
                                 }
+                            }
+                            if let Some(visual) = self.game_sprite_wrapper_visuals.get_mut(&slot) {
+                                let (px, py) = if visual.project_native_draw {
+                                    (1.0, 1.0)
+                                } else {
+                                    (1920.0 / logical_width.max(1) as f32, 1080.0 / logical_height.max(1) as f32)
+                                };
+                                visual.native_x += delta.position[0] * px;
+                                visual.native_y += delta.position[1] * py;
                             }
                         }
                     }
@@ -898,6 +935,56 @@ mod tests {
         vm.advance_actions(&mut sprites);
         assert_eq!(sprites.get(handle).unwrap().info().position.x, 300.0);
         assert_eq!(sprites.get(handle).unwrap().info().color.alpha(), 155);
+    }
+
+    #[test]
+    fn tagged_action_targets_never_fall_back_to_scene_slots() {
+        let (mut vm, mut sprites, handle) = fixture();
+        vm.game_sprites.insert(1, handle);
+        sprites.set_alpha(handle, 0);
+        for target in [0x0100_0001, 0x0200_0001, 0x0210_0001] {
+            call(&mut vm, &mut sprites, 8, &[0, target, 255, 300]);
+            call(&mut vm, &mut sprites, 1, &[0, 300]);
+            vm.set_pal_time(vm.pal_time_ms.wrapping_add(300));
+            vm.advance_actions(&mut sprites);
+            assert_eq!(sprites.get(handle).unwrap().info().color.alpha(), 0,
+                "missing tagged target {target:#x} must not reveal scene slot 1");
+        }
+        assert_eq!(vm.action_targets(1), [handle]);
+    }
+
+    #[test]
+    fn ui_fade_actions_do_not_reveal_hidden_scene_effects() {
+        for (target, group) in [(0x0100_0001, 0), (0x0200_0001, 0), (0x0210_0001, 1)] {
+            let (mut vm, mut sprites, effect) = fixture();
+            vm.game_sprites.insert(1, effect);
+            sprites.set_alpha(effect, 0);
+            let ui = sprites.create_rgba_sprite(
+                1, 1, vec![255; 4], PalVec3::default(), 0, "UI fade target",
+            ).unwrap();
+            sprites.set_alpha(ui, 0);
+            vm.game_buttons.insert((group, 1), GameButtonEntry {
+                registration_order: 0, native_flags: 0, hover_callbacks: [None; 2], handle: ui,
+                name: "UI fade target".into(), visible: true, enabled: true, locked: false,
+                toggle: 0, alpha: 0, slider_offset: 0, base_position: [0; 2],
+                slider_position: [0; 2], hit_rect: None, gosub_point: None,
+                anim_resource: None, anim_play_flag: 0,
+            });
+            call(&mut vm, &mut sprites, 8, &[0, target, 255, 300]);
+            call(&mut vm, &mut sprites, 1, &[0, 300]);
+            vm.advance_actions(&mut sprites);
+            vm.set_pal_time(150);
+            vm.advance_actions(&mut sprites);
+            assert_eq!(sprites.get(effect).unwrap().info().color.alpha(), 0,
+                "UI fade must not animate the hidden scene effect");
+            assert_eq!(sprites.get(ui).unwrap().info().color.alpha(), 127);
+            vm.set_pal_time(300);
+            vm.advance_actions(&mut sprites);
+            assert_eq!(sprites.get(effect).unwrap().info().color.alpha(), 0,
+                "UI fade completion must not commit opacity to the scene effect");
+            assert_eq!(sprites.get(ui).unwrap().info().color.alpha(), 255);
+            assert_eq!(vm.action_targets(1), [effect]);
+        }
     }
 
     fn alphas(sprites: &SpriteSystem, handle: SpriteHandle) -> Vec<u8> {

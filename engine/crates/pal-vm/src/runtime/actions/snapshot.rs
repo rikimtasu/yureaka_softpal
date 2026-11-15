@@ -29,7 +29,7 @@ impl SavedActions {
     }
 }
 
-fn remap(
+pub(super) fn remap(
     state: &mut ActionSubsystemState,
     map: &BTreeMap<SpriteHandle, SpriteHandle>,
     discard: bool,
@@ -43,6 +43,9 @@ fn remap(
         for line in bank.lines.values_mut() {
             if let Some(current) = &mut line.current {
                 current.handles = current.handles.iter().filter_map(|&h| mapped(h)).collect();
+                current.mask = current.mask.and_then(|[from, mask, to]| {
+                    Some([mapped(from)?, mapped(mask)?, mapped(to)?])
+                });
             }
         }
     }

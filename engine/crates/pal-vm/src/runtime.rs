@@ -171,9 +171,8 @@ fn decode_pal_sprite_slot(slot: i32) -> Option<(i32, Option<u8>)> {
         // 0x010000NN / 0x020000NN.  Game-side wrappers pass those values to the
         // same PalSpriteSetColor path as ordinary slots; the low word is the
         // sprite index, while the high byte selects a native layer namespace.
-        // The portable renderer currently stores all script-visible sprite
-        // indices in one table, so resolve the tagged slot to its low index and
-        // preserve the layer only for tracing.
+        // Keep the layer separate: a tagged UI index is not an ordinary scene
+        // slot, even when the corresponding UI target is absent.
         1 | 2 => {
             let index = (raw & 0x0000_FFFF) as i32;
             if (0..10_000).contains(&index) {
@@ -11043,6 +11042,10 @@ impl ScriptRuntime {
                 return ExtCallOutcome::Value(0);
             }
         };
+        // The script anchor puts the portrait cell bottom on the screen edge,
+        // clipping the lower torso; lift it slightly so the portrait reads
+        // as placed in the corner instead of bleeding off the bottom.
+        const FACE_BOTTOM_LIFT: f32 = 30.0;
         let (native_x, native_y) = if face.center_x == -1 || face.center_y == -1 {
             (
                 (decoded.offset_x + dx) as f32,
@@ -11051,7 +11054,7 @@ impl ScriptRuntime {
         } else {
             (
                 (face.center_x as f32 * 1.5 - (decoded.cell_width as f32 * 0.5) + dx as f32),
-                (face.center_y as f32 * 1.5 - decoded.cell_height as f32 + dy as f32),
+                (face.center_y as f32 * 1.5 - decoded.cell_height as f32 + dy as f32 - FACE_BOTTOM_LIFT),
             )
         };
         let z = 4999i32
@@ -13377,6 +13380,12 @@ impl ScriptRuntime {
             desc.option_type = option_type;
             desc.info_extra = info_extra;
             desc.base_priority = base_priority;
+            // The wrapper's cached base alpha must follow the live PAL base.
+            // Named motion programs commit into the PAL sprite without going
+            // through the script alpha setters, so a later image swap would
+            // otherwise resurrect the pre-motion opacity.
+            self.game_sprite_base_alpha
+                .insert(slot, i32::from(color.alpha()));
             let initial_alpha =
                 self.computed_game_sprite_alpha_for_new_wrapper_sprite(slot, color.alpha());
             desc.color = PalColor::from_argb(
@@ -13454,6 +13463,7 @@ impl ScriptRuntime {
         let to = sprites.create(desc);
         self.game_sprites.insert(slot, to);
         if let Some(from_handle) = from {
+            self.rebind_sprite_actions(sprites, from_handle, to);
             for action in &mut self.game_sprite_active_alpha {
                 if action.slot == slot && action.handle == from_handle {
                     action.handle = to;

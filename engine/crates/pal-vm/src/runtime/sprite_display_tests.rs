@@ -202,7 +202,7 @@ fn save_load_keeps_face_registration_and_face_updates_do_not_replace_backgrounds
     );
     let face = sprites.get(runtime.game_sprites[&30]).unwrap();
     assert_eq!(face.position.x, 164.0);
-    assert_eq!(face.position.y, 1078.0);
+    assert_eq!(face.position.y, 1048.0);
     assert!(face.smooth_upscale);
     runtime.stack.push(0);
     assert_eq!(
@@ -321,4 +321,158 @@ fn completed_action_scale_survives_expression_replacement_and_wrapper_commit() {
         (sprites.get(handle).unwrap().scale - 0.9).abs() < 0.0001,
         "a later wrapper commit must not reset the completed action scale"
     );
+}
+
+fn action_replacement_fixture() -> (ImageRoot, ResourceManager, CoreAssets, ScriptRuntime, SpriteSystem) {
+    let root = ImageRoot::new();
+    let mut resources = ResourceManager::new(&root.0, Nls::ShiftJis);
+    let (mut assets, _) = empty_core_assets(false);
+    assets.registered_softpal = true;
+    let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+    let mut sprites = SpriteSystem::new();
+    let name = runtime.store_dynamic_string("scene".into());
+    runtime.stack.extend([0, 0, 0, 10, name]);
+    assert_eq!(runtime.ext_sp_set(5, &assets, Nls::ShiftJis,
+        Some(&mut resources), Some(&mut sprites), None, false), ExtCallOutcome::Value(1));
+    (root, resources, assets, runtime, sprites)
+}
+
+fn action_call(runtime: &mut ScriptRuntime, sprites: &mut SpriteSystem, index: u16, args: &[i32]) {
+    runtime.stack.extend(args.iter().rev());
+    runtime.dispatch_action(index, Some(sprites));
+}
+
+fn replace_expression(runtime: &mut ScriptRuntime, sprites: &mut SpriteSystem,
+    resources: &mut ResourceManager, assets: &CoreAssets) {
+    let name = runtime.store_dynamic_string("next.png".into());
+    runtime.stack.extend([300, 1, 10, name]);
+    assert_eq!(runtime.ext_sp_set_transition(assets, Nls::ShiftJis,
+        Some(resources), Some(sprites)), ExtCallOutcome::Value(1));
+}
+
+fn motion_program(code: &[u8]) -> crate::ani::AniProgram {
+    let mut bytes = code.to_vec();
+    // Single entry point at offset zero; these tests use straight-line code.
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    crate::ani::AniProgram::parse(&bytes).unwrap()
+}
+
+#[test]
+fn completed_action_alpha_survives_expression_replacement() {
+    let (_root, mut resources, assets, mut runtime, mut sprites) = action_replacement_fixture();
+    runtime.stack.extend([0, 10]);
+    runtime.ext_sp_set_alpha(Some(&mut sprites));
+    action_call(&mut runtime, &mut sprites, 8, &[0, 10, 255, 100]);
+    action_call(&mut runtime, &mut sprites, 0, &[0, 200]);
+    runtime.advance_actions(&mut sprites);
+    runtime.set_pal_time(200);
+    runtime.advance_actions(&mut sprites);
+    assert_eq!(sprites.get(runtime.game_sprites[&10]).unwrap().info().color.alpha(), 255);
+    replace_expression(&mut runtime, &mut sprites, &mut resources, &assets);
+    assert_eq!(sprites.get(runtime.game_sprites[&10]).unwrap().info().color.alpha(), 255,
+        "expression changes must not restore the pre-fade transparent base");
+}
+
+#[test]
+fn completed_action_position_survives_later_wrapper_commits() {
+    let (_root, _resources, _assets, mut runtime, mut sprites) = action_replacement_fixture();
+    action_call(&mut runtime, &mut sprites, 5, &[0, 10, 60, 30, 0, 100]);
+    action_call(&mut runtime, &mut sprites, 0, &[0, 200]);
+    runtime.advance_actions(&mut sprites);
+    runtime.set_pal_time(200);
+    runtime.advance_actions(&mut sprites);
+    let handle = runtime.game_sprites[&10];
+    let position = sprites.get(handle).unwrap().info().position;
+    assert_eq!(position, PalVec3::new(60, 30, 0));
+    runtime.commit_game_sprite_wrapper_visual(&mut sprites, 10, handle);
+    assert_eq!(sprites.get(handle).unwrap().info().position, position,
+        "a later wrapper commit must not undo completed movement");
+}
+
+#[test]
+fn named_motion_follows_expression_replacement() {
+    let (_root, mut resources, assets, mut runtime, mut sprites) = action_replacement_fixture();
+    let old = runtime.game_sprites[&10];
+    // Persist the fade, then animate alpha -200 over one second and wait.
+    let mut code = vec![0x13, 0x03];
+    code.extend_from_slice(&(-200i32).to_le_bytes());
+    code.extend_from_slice(&1000i32.to_le_bytes());
+    code.push(0xFE);
+    code.extend_from_slice(&1000i32.to_le_bytes());
+    assert!(sprites.start_motion(old, motion_program(&code)));
+    sprites.advance_motion_entries(400);
+    let before = sprites.get(old).unwrap().combined_lanes().alpha;
+    assert_eq!(before, -80);
+    replace_expression(&mut runtime, &mut sprites, &mut resources, &assets);
+    let new = runtime.game_sprites[&10];
+    assert_ne!(old, new);
+    assert!(sprites.motion_active(new), "the live replacement must keep the motion program");
+    assert!(!sprites.motion_active(old), "the retiring image must not keep animating");
+    assert_eq!(
+        sprites.get(new).unwrap().combined_lanes().alpha, before,
+        "in-flight motion must follow the replacement image"
+    );
+    sprites.advance_motion_entries(200);
+    assert_eq!(sprites.get(new).unwrap().combined_lanes().alpha, -120);
+    assert_eq!(
+        sprites.get(old).unwrap().combined_lanes().alpha, before,
+        "the retiring image must freeze at its last animated frame"
+    );
+    sprites.advance_motion_entries(400);
+    // The thread ends on the frame after its final wait clears, like native.
+    sprites.advance_motion_entries(16);
+    assert!(!sprites.motion_active(new));
+    assert_eq!(
+        sprites.get(new).unwrap().info().color.alpha(), 55,
+        "a persisted motion fade must land on the replacement image base"
+    );
+    replace_expression(&mut runtime, &mut sprites, &mut resources, &assets);
+    let newer = runtime.game_sprites[&10];
+    assert_eq!(
+        sprites.get(newer).unwrap().info().color.alpha(), 55,
+        "a later image swap must not resurrect pre-motion opacity"
+    );
+}
+
+#[test]
+fn active_actions_follow_expression_replacements_without_restarting() {
+    let (_root, mut resources, assets, mut runtime, mut sprites) = action_replacement_fixture();
+    runtime.stack.extend([0, 10]);
+    runtime.ext_sp_set_alpha(Some(&mut sprites));
+    action_call(&mut runtime, &mut sprites, 5, &[0, 10, 60, 40, 0, 200]);
+    action_call(&mut runtime, &mut sprites, 8, &[1, 10, 200, 200]);
+    action_call(&mut runtime, &mut sprites, 11, &[2, 10, 100, 200]);
+    action_call(&mut runtime, &mut sprites, 10, &[3, 10, 0, 0, 128, 200]);
+    action_call(&mut runtime, &mut sprites, 0, &[0, 400]);
+    runtime.advance_actions(&mut sprites);
+    runtime.set_pal_time(50);
+    runtime.advance_actions(&mut sprites);
+    let before = sprites.get(runtime.game_sprites[&10]).unwrap().info();
+    assert_eq!(before.color.alpha(), 50);
+    replace_expression(&mut runtime, &mut sprites, &mut resources, &assets);
+    let handle = runtime.game_sprites[&10];
+    let after = sprites.get(handle).unwrap().info();
+    assert_eq!(after.color.alpha(), before.color.alpha(), "active fade must follow the new image");
+    assert_eq!(after.position, before.position, "active movement must not jump or be baked twice");
+    assert_eq!(after.scale, before.scale, "active scale must follow the new image");
+    assert_eq!(after.rotation, before.rotation, "active rotation must follow the new image");
+    runtime.set_pal_time(100);
+    runtime.advance_actions(&mut sprites);
+    let after = sprites.get(handle).unwrap().info();
+    assert_eq!(after.color.alpha(), 100);
+    assert_eq!(after.position, PalVec3::new(30, 20, 0));
+    assert_eq!(after.scale, 1.5);
+    assert_eq!(after.rotation.z, 64.0);
+    runtime.set_pal_time(400);
+    runtime.advance_actions(&mut sprites);
+    assert_eq!(sprites.get(handle).unwrap().info().color.alpha(), 200);
+    assert_eq!(sprites.get(handle).unwrap().info().position, PalVec3::new(60, 40, 0));
+    assert_eq!(sprites.get(handle).unwrap().info().scale, 2.0);
+    assert_eq!(sprites.get(handle).unwrap().info().rotation.z, 128.0);
+    replace_expression(&mut runtime, &mut sprites, &mut resources, &assets);
+    let replaced = sprites.get(runtime.game_sprites[&10]).unwrap().info();
+    assert_eq!(replaced.color.alpha(), 200, "completed fade must survive replacement");
+    assert_eq!(replaced.position, PalVec3::new(60, 40, 0), "completed move must survive replacement");
+    assert_eq!(replaced.scale, 2.0, "completed scale must survive replacement");
+    assert_eq!(replaced.rotation.z, 128.0, "completed rotation must survive replacement");
 }

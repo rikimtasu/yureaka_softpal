@@ -497,6 +497,34 @@ impl SpriteSystem {
         true
     }
 
+    /// Move a running `.ani` program, queued tweens and in-flight lanes to the
+    /// replacement image in the same wrapper slot. Game.exe keys motion
+    /// entries by slot (`gSpriteMotionTable`), not by the PAL sprite pointer,
+    /// so an image swap must keep animating the live wrapper.
+    pub fn rebind_motion(&mut self, from: SpriteHandle, to: SpriteHandle) -> bool {
+        if from == to || !self.sprites.contains_key(&to) {
+            return false;
+        }
+        let mut moved = false;
+        if let Some(player) = self.ani_motions.remove(&from) {
+            self.ani_motions.insert(to, player);
+            moved = true;
+        }
+        if let Some(entry) = self.motion_entries.remove(&from) {
+            self.motion_entries.insert(to, entry);
+            moved = true;
+        }
+        if let Some(lanes) = self.sprites.get(&from).map(|sprite| sprite.motion_lanes) {
+            if lanes != SpriteActionLanes::default() {
+                if let Some(sprite) = self.sprites.get_mut(&to) {
+                    sprite.motion_lanes.add(lanes);
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+
     /// Game action type 20 (trenka.exe 0x401DF0): reveal `to` through the
     /// mask. With `threshold` p, mask level m = 255 - mask blue selects
     /// from's alpha below p, a 32-step ramp up to p + 31, and zero above.
