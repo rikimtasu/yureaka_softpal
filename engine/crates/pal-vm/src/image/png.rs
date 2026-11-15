@@ -79,7 +79,7 @@ pub(super) fn decode(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
         cell_height: height,
         offset_x: 0,
         offset_y: 0,
-        rgba,
+        rgba: std::sync::Arc::new(rgba),
     })
 }
 
@@ -131,7 +131,7 @@ mod tests {
             (2, 2, 2, 2)
         );
         assert_eq!((image.offset_x, image.offset_y), (0, 0));
-        assert_eq!(image.rgba, pixels);
+        assert_eq!(image.rgba.as_slice(), pixels);
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
             &[0b00011000],
         );
         assert_eq!(
-            decode(&bytes).unwrap().rgba,
+            decode(&bytes).unwrap().rgba.as_slice(),
             [255, 0, 0, 0, 0, 255, 0, 127, 0, 0, 255, 255]
         );
     }
@@ -163,7 +163,7 @@ mod tests {
             &[0b00011011],
         );
         assert_eq!(
-            decode(&gray).unwrap().rgba,
+            decode(&gray).unwrap().rgba.as_slice(),
             [0, 0, 0, 255, 85, 85, 85, 255, 170, 170, 170, 255, 255, 255, 255, 255]
         );
         let rgb = encode(
@@ -175,7 +175,7 @@ mod tests {
             Some(&[0, 10, 0, 20, 0, 30]),
             &[10, 20, 30, 10, 20, 31],
         );
-        assert_eq!(decode(&rgb).unwrap().rgba, [10, 20, 30, 0, 10, 20, 31, 255]);
+        assert_eq!(decode(&rgb).unwrap().rgba.as_slice(), [10, 20, 30, 0, 10, 20, 31, 255]);
     }
 
     #[test]
@@ -190,7 +190,7 @@ mod tests {
             &[12, 34, 56, 78],
         );
         assert_eq!(
-            decode(&gray).unwrap().rgba,
+            decode(&gray).unwrap().rgba.as_slice(),
             [12, 12, 12, 34, 56, 56, 56, 78]
         );
         let rgba = encode(
@@ -202,7 +202,7 @@ mod tests {
             None,
             &[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
         );
-        assert_eq!(decode(&rgba).unwrap().rgba, [0x12, 0x56, 0x9a, 0xde]);
+        assert_eq!(decode(&rgba).unwrap().rgba.as_slice(), [0x12, 0x56, 0x9a, 0xde]);
     }
 
     #[test]

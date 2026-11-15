@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::archive_dat::{parse_archive_dat_paths, parse_archive_dat_profile};
 use crate::decrypt::decrypt_pal_dollar_file;
@@ -10,7 +12,7 @@ use crate::nls::Nls;
 use crate::pac::PacArchive;
 use crate::vfs;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AssetSource {
     Loose { path: PathBuf },
     Pac { pac_path: PathBuf, key: PacKey },
@@ -23,6 +25,16 @@ pub struct LoadedAsset {
     pub source: AssetSource,
 }
 
+/// Bytes retained per opened resource, bounded total.
+const OPEN_CACHE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+
+#[derive(Debug)]
+struct OpenCacheEntry {
+    bytes: Arc<Vec<u8>>,
+    identity: (u64, SystemTime),
+    byte_len: usize,
+}
+
 #[derive(Debug)]
 pub struct ResourceManager {
     root: PathBuf,
@@ -32,6 +44,8 @@ pub struct ResourceManager {
     language_archive: Option<String>,
     last_path_wins: bool,
     patch: Option<MaiPatch>,
+    open_cache: HashMap<AssetSource, OpenCacheEntry>,
+    open_cache_bytes: usize,
 }
 
 impl ResourceManager {
@@ -44,6 +58,8 @@ impl ResourceManager {
             language_archive: None,
             last_path_wins: false,
             patch: None,
+            open_cache: HashMap::new(),
+            open_cache_bytes: 0,
         }
     }
 
@@ -88,13 +104,21 @@ impl ResourceManager {
     pub fn select_archive_profile(&mut self, profile: usize) -> Result<()> {
         self.paths.clear();
         self.pacs.clear();
+        self.clear_open_cache();
         self.add_path("data");
         let archive = match self.open("archive.dat") {
             Ok(asset) => asset,
             Err(AssetError::AssetNotFound { .. }) => {
                 let key = make_pac_key("archive.dat", self.nls)?;
-                self.try_open_in_base("csv", "archive.dat", &key)?
-                    .ok_or_else(|| AssetError::AssetNotFound { name: "archive.dat".into() })?
+                let source = self
+                    .resolve_in_base("csv", "archive.dat", &key)?
+                    .ok_or_else(|| AssetError::AssetNotFound { name: "archive.dat".into() })?;
+                let bytes = self.read_source(&source)?;
+                LoadedAsset {
+                    name: "archive.dat".into(),
+                    bytes,
+                    source,
+                }
             }
             Err(err) => return Err(err),
         };
@@ -117,6 +141,7 @@ impl ResourceManager {
 
     pub fn set_last_path_wins(&mut self, enabled: bool) {
         self.last_path_wins = enabled;
+        self.clear_open_cache();
     }
 
     /// Append every search path named by an `archive*.dat` list, which is a
@@ -151,6 +176,7 @@ impl ResourceManager {
         if normalized.is_empty() {
             return;
         }
+        self.clear_open_cache();
         if self.last_path_wins {
             // A repeated native registration becomes the newest list node.
             self.paths.retain(|existing| existing != &normalized);
@@ -175,6 +201,12 @@ impl ResourceManager {
     /// path, and [`Self::replacement_image`] exposes its sprite pixels.
     pub fn set_mai_patch(&mut self, patch: MaiPatch) {
         self.patch = Some(patch);
+        self.clear_open_cache();
+    }
+
+    fn clear_open_cache(&mut self) {
+        self.open_cache.clear();
+        self.open_cache_bytes = 0;
     }
 
     pub fn mai_patch(&self) -> Option<&MaiPatch> {
@@ -190,6 +222,8 @@ impl ResourceManager {
     }
 
     pub fn open(&mut self, name: &str) -> Result<LoadedAsset> {
+        // Patch replacements bypass the cache: they are expected to be
+        // edited while the game is running during translation work.
         if let Some(path) = self.patch.as_ref().and_then(|patch| patch.replacement_file(name)) {
             return Ok(LoadedAsset {
                 name: name.to_owned(),
@@ -203,19 +237,120 @@ impl ResourceManager {
         if self.last_path_wins {
             paths.reverse();
         }
+        let mut source = None;
         for base in paths {
-            if let Some(asset) = self.try_open_in_base(&base, name, &key)? {
-                return Ok(asset);
+            if let Some(found) = self.resolve_in_base(&base, name, &key)? {
+                source = Some(found);
+                break;
             }
         }
-
-        if let Some(asset) = self.try_open_in_root(name, &key)? {
-            return Ok(asset);
+        if source.is_none() {
+            source = self.resolve_in_root(name, &key)?;
         }
-
-        Err(AssetError::AssetNotFound {
+        let Some(source) = source else {
+            return Err(AssetError::AssetNotFound {
+                name: name.to_owned(),
+            });
+        };
+        let bytes = self.read_source(&source)?;
+        Ok(LoadedAsset {
             name: name.to_owned(),
+            bytes,
+            source,
         })
+    }
+
+    /// Freshly resolve (without reading data) which source serves `name`.
+    /// Resolution runs on every open so a loose file created later still
+    /// shadows an earlier cached archive entry.
+    fn resolve_in_base(
+        &mut self,
+        base: &str,
+        name: &str,
+        key: &PacKey,
+    ) -> Result<Option<AssetSource>> {
+        let loose = self.loose_path_for_base(base, name);
+        if vfs::is_file(&loose) {
+            return Ok(Some(AssetSource::Loose { path: loose }));
+        }
+        let pac_path = self.pac_path_for_base(base);
+        if !self.pacs.contains_key(&pac_path) && !vfs::is_file(&pac_path) {
+            return Ok(None);
+        }
+        let pac = self.ensure_pac_loaded(&pac_path)?;
+        if pac.find_entry(key)?.is_some() {
+            return Ok(Some(AssetSource::Pac {
+                pac_path,
+                key: *key,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn resolve_in_root(&mut self, name: &str, key: &PacKey) -> Result<Option<AssetSource>> {
+        let loose = join_pal_path(&self.root, name);
+        if vfs::is_file(&loose) {
+            return Ok(Some(AssetSource::Loose { path: loose }));
+        }
+        let pac_path = append_pac_extension(&self.root);
+        if vfs::is_file(&pac_path) {
+            let pac = self.ensure_pac_loaded(&pac_path)?;
+            if pac.find_entry(key)?.is_some() {
+                return Ok(Some(AssetSource::Pac {
+                    pac_path,
+                    key: *key,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read bytes for a resolved source, serving the identity-validated
+    /// in-memory copy when the backing file has not changed.
+    fn read_source(&mut self, source: &AssetSource) -> Result<Vec<u8>> {
+        let cached = self
+            .open_cache
+            .get(source)
+            .filter(|entry| {
+                source_identity(source)
+                    .ok()
+                    .is_some_and(|current| current == entry.identity)
+            })
+            .map(|entry| entry.bytes.clone());
+        if let Some(bytes) = cached {
+            return Ok((*bytes).clone());
+        }
+        if let Some(entry) = self.open_cache.remove(source) {
+            self.open_cache_bytes = self.open_cache_bytes.saturating_sub(entry.byte_len);
+        }
+        let bytes = match source {
+            AssetSource::Loose { path } => vfs::read_all(path)?,
+            AssetSource::Pac { pac_path, key } => {
+                let pac = self.ensure_pac_loaded(pac_path)?;
+                pac.read_key(key)?
+                    .ok_or_else(|| AssetError::AssetNotFound {
+                        name: format!("pac entry {key:?}"),
+                    })?
+            }
+        };
+        if bytes.len() <= OPEN_CACHE_BYTE_BUDGET {
+            if let Ok(identity) = source_identity(source) {
+                let byte_len = bytes.len();
+                if self.open_cache_bytes + byte_len > OPEN_CACHE_BYTE_BUDGET {
+                    self.clear_open_cache();
+                }
+                self.open_cache_bytes += byte_len;
+                self.open_cache.insert(
+                    source.clone(),
+                    OpenCacheEntry {
+                        bytes: Arc::new(bytes.clone()),
+                        identity,
+                        byte_len,
+                    },
+                );
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn open_decrypting(&mut self, name: &str) -> Result<LoadedAsset> {
@@ -230,68 +365,6 @@ impl ResourceManager {
 
     pub fn list_loaded_pacs(&self) -> impl Iterator<Item = &PacArchive> {
         self.pacs.values()
-    }
-
-    fn try_open_in_base(
-        &mut self,
-        base: &str,
-        name: &str,
-        key: &PacKey,
-    ) -> Result<Option<LoadedAsset>> {
-        let loose = self.loose_path_for_base(base, name);
-        if vfs::is_file(&loose) {
-            let bytes = vfs::read_all(&loose)?;
-            return Ok(Some(LoadedAsset {
-                name: name.to_owned(),
-                bytes,
-                source: AssetSource::Loose { path: loose },
-            }));
-        }
-
-        let pac_path = self.pac_path_for_base(base);
-        if !self.pacs.contains_key(&pac_path) && !vfs::is_file(&pac_path) {
-            return Ok(None);
-        }
-        let pac = self.ensure_pac_loaded(&pac_path)?;
-        if let Some(bytes) = pac.read_key(key)? {
-            return Ok(Some(LoadedAsset {
-                name: name.to_owned(),
-                bytes,
-                source: AssetSource::Pac {
-                    pac_path,
-                    key: *key,
-                },
-            }));
-        }
-        Ok(None)
-    }
-
-    fn try_open_in_root(&mut self, name: &str, key: &PacKey) -> Result<Option<LoadedAsset>> {
-        let loose = join_pal_path(&self.root, name);
-        if vfs::is_file(&loose) {
-            let bytes = vfs::read_all(&loose)?;
-            return Ok(Some(LoadedAsset {
-                name: name.to_owned(),
-                bytes,
-                source: AssetSource::Loose { path: loose },
-            }));
-        }
-
-        let pac_path = append_pac_extension(&self.root);
-        if vfs::is_file(&pac_path) {
-            let pac = self.ensure_pac_loaded(&pac_path)?;
-            if let Some(bytes) = pac.read_key(key)? {
-                return Ok(Some(LoadedAsset {
-                    name: name.to_owned(),
-                    bytes,
-                    source: AssetSource::Pac {
-                        pac_path,
-                        key: *key,
-                    },
-                }));
-            }
-        }
-        Ok(None)
     }
 
     fn loose_path_for_base(&self, base: &str, name: &str) -> PathBuf {
@@ -339,6 +412,13 @@ fn append_pac_extension(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".pac");
     PathBuf::from(s)
+}
+
+fn source_identity(source: &AssetSource) -> Result<(u64, SystemTime)> {
+    match source {
+        AssetSource::Loose { path } => vfs::file_identity(path),
+        AssetSource::Pac { pac_path, .. } => vfs::file_identity(pac_path),
+    }
 }
 
 #[allow(dead_code)]

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
 pub struct DecodedImage {
@@ -10,7 +10,17 @@ pub struct DecodedImage {
     pub cell_height: u32,
     pub offset_x: i32,
     pub offset_y: i32,
-    pub rgba: Vec<u8>,
+    /// Shared pixel buffer. The asset cache and sprite surfaces share this
+    /// allocation (a cache hit is an `Arc` clone, not a 16 MiB memcpy);
+    /// in-place edits go through `Arc::make_mut`, so a cached entry can
+    /// never be corrupted by a later delta patch or replacement image.
+    pub rgba: Arc<Vec<u8>>,
+}
+
+impl DecodedImage {
+    pub fn new(width: u32, height: u32, cell_width: u32, cell_height: u32, offset_x: i32, offset_y: i32, rgba: Vec<u8>) -> Self {
+        Self { width, height, cell_width, cell_height, offset_x, offset_y, rgba: Arc::new(rgba) }
+    }
 }
 
 pub fn decode_image(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
@@ -36,10 +46,26 @@ pub fn decode_image(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
 }
 
 /// Reuse decoded images, including completed deltas, across sprite loads.
-/// Delta keys include freshly resolved base content, so edits stay visible.
+/// Plain images are keyed by a SHA-256 of the encoded file. Completed deltas
+/// are keyed by a SHA-256 of only the small top file; the retained encoded
+/// chain is compared byte-for-byte, so edits to any ancestor still miss.
 #[derive(Debug)]
 pub struct ImageDecoder {
-    cache: crate::asset_cache::ContentCache<DecodedImage>,
+    cache: crate::asset_cache::ContentCache<CachedImage>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedImage {
+    image: DecodedImage,
+    /// For completed PGD3 deltas: `[top, ..., base]` encoded bytes. Empty
+    /// for plain images (their key is already the full content hash).
+    chain: Vec<Arc<[u8]>>,
+}
+
+impl CachedImage {
+    fn accounted_bytes(&self) -> usize {
+        self.image.rgba.len() + self.chain.iter().map(|level| level.len()).sum::<usize>()
+    }
 }
 
 impl Default for ImageDecoder {
@@ -55,10 +81,12 @@ impl ImageDecoder {
             }
             return self.decode_delta_cached(bytes, resolver);
         }
-        let key = crate::asset_cache::ContentCache::<DecodedImage>::key(bytes);
-        if let Some(image) = self.cache.get(&key) { return Ok(image); }
+        let key = crate::asset_cache::ContentCache::<CachedImage>::key(bytes);
+        if let Some(cached) = self.cache.get(&key) {
+            if cached.chain.is_empty() { return Ok(cached.image); }
+        }
         let image = decode_image(bytes)?;
-        self.cache_image(key, &image);
+        self.cache.insert(key, CachedImage { image: image.clone(), chain: Vec::new() }, image.rgba.len());
         Ok(image)
     }
 
@@ -70,71 +98,88 @@ impl ImageDecoder {
     where
         F: FnMut(&str) -> anyhow::Result<Vec<u8>>,
     {
-        let mut inputs = vec![ImageCacheInput {
-            bytes: Cow::Borrowed(bytes),
-            key: crate::asset_cache::ContentCache::<DecodedImage>::key(bytes),
-        }];
-        // Resolve and hash the whole dependency chain before checking a final
-        // image hit. Keep these reads for decoding a miss without reopening it.
+        // Resolve the whole chain (top first, base last) without hashing
+        // ancestors: each level is small except the base, and the base is
+        // validated below by an exact byte comparison against the retained
+        // chain instead of a SHA-256 over ~800 KiB.
+        let mut inputs = vec![Cow::Borrowed(bytes)];
+        let mut seen_names: Vec<String> = Vec::new();
         while let Some(input) = inputs.last() {
-            if input.bytes.len() < 0x38 || !input.bytes.starts_with(b"PGD3") {
+            if input.len() < 0x38 || !input.starts_with(b"PGD3") {
                 break;
             }
-            let name = pgd3_base_name(&input.bytes)?;
-            let base = resolver(&name)
-                .map_err(|err| anyhow::anyhow!("PGD3 base {name:?} decode failed: {err}"))?;
-            let key = crate::asset_cache::ContentCache::<DecodedImage>::key(&base);
+            let name = pgd3_base_name(input)?;
             anyhow::ensure!(
-                !inputs.iter().any(|input| input.key == key),
+                !seen_names.iter().any(|seen| seen == &name),
                 "PGD3 cyclic base dependency at {name:?}"
             );
-            inputs.push(ImageCacheInput { bytes: Cow::Owned(base), key });
+            seen_names.push(name.clone());
+            anyhow::ensure!(inputs.len() < 32, "PGD3 dependency chain is too deep or cyclic");
+            let base = resolver(&name)
+                .map_err(|err| anyhow::anyhow!("PGD3 base {name:?} decode failed: {err}"))?;
+            inputs.push(Cow::Owned(base));
         }
-        for index in (0..inputs.len() - 1).rev() {
-            inputs[index].key = completed_delta_key(&inputs[index].key, &inputs[index + 1].key);
+        let top_key = crate::asset_cache::ContentCache::<CachedImage>::key(bytes);
+        if let Some(cached) = self.cache.get(&top_key) {
+            if chain_matches(&cached.chain, &inputs) {
+                return Ok(cached.image);
+            }
         }
-        // Start from the nearest cached result, not a cloned base when the
-        // completed top-level delta is already available.
-        let cached = inputs.iter().enumerate().find_map(|(index, input)| {
-            self.cache.get(&input.key).map(|image| (image, index))
-        });
-        let (mut image, pending) = match cached {
-            Some(cached) => cached,
+        // Start from the nearest cached suffix instead of always decoding
+        // from the base. Suffix validation is the same byte comparison.
+        let mut start: Option<(DecodedImage, usize)> = None;
+        for index in 1..inputs.len() {
+            let suffix_key = crate::asset_cache::ContentCache::<CachedImage>::key(&inputs[index]);
+            if let Some(cached) = self.cache.get(&suffix_key) {
+                let valid = if index + 1 == inputs.len() {
+                    cached.chain.is_empty()
+                } else {
+                    chain_matches(&cached.chain, &inputs[index..])
+                };
+                if valid {
+                    start = Some((cached.image, index));
+                    break;
+                }
+            }
+        }
+        let (mut image, pending) = match start {
+            Some(start) => start,
             None => {
                 let index = inputs.len() - 1;
-                let image = decode_image(&inputs[index].bytes)?;
-                self.cache_image(inputs[index].key, &image);
+                let image = decode_image(&inputs[index])?;
+                let key = crate::asset_cache::ContentCache::<CachedImage>::key(&inputs[index]);
+                self.cache.insert(key, CachedImage { image: image.clone(), chain: Vec::new() }, image.rgba.len());
                 (image, index)
             }
         };
-        for input in inputs[..pending].iter().rev() {
+        for index in (0..pending).rev() {
             let mut base = Some(image);
-            image = decode_pgd3_with_base(&input.bytes, &mut |_| {
+            image = decode_pgd3_with_base(&inputs[index], &mut |_| {
                 base.take().ok_or_else(|| anyhow::anyhow!("PGD3 decoded base already consumed"))
             })?;
-            self.cache_image(input.key, &image);
+            let key = if index == 0 {
+                top_key
+            } else {
+                crate::asset_cache::ContentCache::<CachedImage>::key(&inputs[index])
+            };
+            let chain = inputs[index..]
+                .iter()
+                .map(|level| Arc::from(&level[..]))
+                .collect::<Vec<_>>();
+            let entry = CachedImage { image: image.clone(), chain };
+            let accounted = entry.accounted_bytes();
+            self.cache.insert(key, entry, accounted);
         }
         Ok(image)
     }
-
-    fn cache_image(&mut self, key: [u8; 32], image: &DecodedImage) {
-        if self.cache.can_store(image.rgba.len()) {
-            self.cache.insert(key, image.clone(), image.rgba.len());
-        }
-    }
 }
 
-struct ImageCacheInput<'a> {
-    bytes: Cow<'a, [u8]>,
-    key: [u8; 32],
-}
-
-fn completed_delta_key(encoded_key: &[u8; 32], base_key: &[u8; 32]) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"PAL-PGD3-CACHE\0");
-    hash.update(encoded_key);
-    hash.update(base_key);
-    hash.finalize().into()
+fn chain_matches(chain: &[Arc<[u8]>], inputs: &[Cow<'_, [u8]>]) -> bool {
+    chain.len() == inputs.len()
+        && chain
+            .iter()
+            .zip(inputs.iter())
+            .all(|(retained, current)| retained.as_ref() == &current[..])
 }
 
 mod bmp;
@@ -365,7 +410,7 @@ fn decode_tga(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
         cell_height: height as u32,
         offset_x: 0,
         offset_y: 0,
-        rgba,
+        rgba: Arc::new(rgba),
     })
 }
 
@@ -479,9 +524,12 @@ fn xor_pgd3_stream(
         || offset_y.saturating_add(height) > base.height as usize {
         anyhow::bail!("PGD3 patch exceeds base image");
     }
+    // The base may be a cache-shared allocation: detach it before patching.
+    let rgba = Arc::make_mut(&mut base.rgba);
+    let base_width = base.width as usize;
     visit_pal_rows(stream, width, height, pixel_size, |y, row| {
-        let start = ((offset_y + y) * base.width as usize + offset_x) * 4;
-        for (dst, patch) in base.rgba[start..start + width * 4].chunks_exact_mut(4)
+        let start = ((offset_y + y) * base_width + offset_x) * 4;
+        for (dst, patch) in rgba[start..start + width * 4].chunks_exact_mut(4)
             .zip(row.chunks_exact(pixel_size)) {
             dst[0] ^= patch[2];
             dst[1] ^= patch[1];
@@ -613,7 +661,7 @@ fn decode_pgd_ge(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
         cell_height: cell_height.min(height as u32).max(1),
         offset_x,
         offset_y,
-        rgba,
+        rgba: Arc::new(rgba),
     })
 }
 
@@ -658,19 +706,16 @@ mod stream_tests {
 
     #[test]
     fn completed_delta_images_cache_the_final_pixels() {
-        let mut decoder = ImageDecoder { cache: crate::asset_cache::ContentCache::new(8) };
+        let mut decoder = ImageDecoder { cache: crate::asset_cache::ContentCache::new(4096) };
         let base = tga([10, 20, 30, 255]);
         let encoded = delta("base", [3, 2, 1, 0]);
-        let key = completed_delta_key(
-            &crate::asset_cache::ContentCache::<DecodedImage>::key(&encoded),
-            &crate::asset_cache::ContentCache::<DecodedImage>::key(&base),
-        );
+        let key = crate::asset_cache::ContentCache::<CachedImage>::key(&encoded);
         let mut first = decoder.decode(&encoded, &mut |_| Ok(base.clone())).unwrap();
-        assert_eq!(first.rgba, [11, 22, 29, 255]);
+        assert_eq!(first.rgba.as_slice(), [11, 22, 29, 255]);
         let cached = decoder.cache.get(&key).expect("completed delta image must be cached");
-        assert_eq!(cached.rgba, first.rgba);
-        first.rgba.fill(0);
-        assert_eq!(decoder.decode(&encoded, &mut |_| Ok(base.clone())).unwrap().rgba, cached.rgba);
+        assert_eq!(cached.image.rgba.as_slice(), first.rgba.as_slice());
+        std::sync::Arc::make_mut(&mut first.rgba).fill(0);
+        assert_eq!(decoder.decode(&encoded, &mut |_| Ok(base.clone())).unwrap().rgba.as_slice(), cached.image.rgba.as_slice());
     }
 
     #[test]
@@ -688,15 +733,15 @@ mod stream_tests {
                 sources.get(name).cloned().ok_or_else(|| anyhow::anyhow!("missing {name}"))
             })
         };
-        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba, [15, 19, 27, 255]);
-        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba, [15, 19, 27, 255]);
+        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba.as_slice(), [15, 19, 27, 255]);
+        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba.as_slice(), [15, 19, 27, 255]);
 
         sources.insert("base", tga([40, 50, 60, 255]));
-        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba, [45, 53, 57, 255]);
+        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba.as_slice(), [45, 53, 57, 255]);
         sources.insert("middle", delta("base", [9, 8, 7, 0]));
-        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba, [43, 63, 51, 255]);
+        assert_eq!(load(&mut decoder, &top, &sources).unwrap().rgba.as_slice(), [43, 63, 51, 255]);
         let changed_top = delta("middle", [12, 11, 10, 0]);
-        assert_eq!(load(&mut decoder, &changed_top, &sources).unwrap().rgba, [37, 49, 57, 255]);
+        assert_eq!(load(&mut decoder, &changed_top, &sources).unwrap().rgba.as_slice(), [37, 49, 57, 255]);
 
         sources.remove("base");
         assert!(load(&mut decoder, &changed_top, &sources).is_err());
@@ -704,23 +749,19 @@ mod stream_tests {
 
     #[test]
     fn completed_deltas_share_the_existing_cache_budget_with_bases() {
-        let mut decoder = ImageDecoder { cache: crate::asset_cache::ContentCache::new(8) };
+        let mut decoder = ImageDecoder { cache: crate::asset_cache::ContentCache::new(110) };
         let base = tga([10, 20, 30, 255]);
-        let base_key = crate::asset_cache::ContentCache::<DecodedImage>::key(&base);
+        let base_key = crate::asset_cache::ContentCache::<CachedImage>::key(&base);
         let first = delta("base", [3, 2, 1, 0]);
         let second = delta("base", [6, 5, 4, 0]);
-        let first_key = completed_delta_key(
-            &crate::asset_cache::ContentCache::<DecodedImage>::key(&first), &base_key,
-        );
-        let second_key = completed_delta_key(
-            &crate::asset_cache::ContentCache::<DecodedImage>::key(&second), &base_key,
-        );
+        let first_key = crate::asset_cache::ContentCache::<CachedImage>::key(&first);
+        let second_key = crate::asset_cache::ContentCache::<CachedImage>::key(&second);
         decoder.decode(&first, &mut |_| Ok(base.clone())).unwrap();
         decoder.decode(&second, &mut |_| Ok(base.clone())).unwrap();
         assert!(decoder.cache.get(&first_key).is_none());
         assert!(decoder.cache.get(&base_key).is_some());
         assert!(decoder.cache.get(&second_key).is_some());
-        assert_eq!(decoder.decode(&first, &mut |_| Ok(base.clone())).unwrap().rgba, [11, 22, 29, 255]);
+        assert_eq!(decoder.decode(&first, &mut |_| Ok(base.clone())).unwrap().rgba.as_slice(), [11, 22, 29, 255]);
         assert!(decoder.cache.get(&second_key).is_none());
         assert!(decoder.cache.get(&first_key).is_some());
     }
@@ -730,12 +771,9 @@ mod stream_tests {
         let mut decoder = ImageDecoder { cache: crate::asset_cache::ContentCache::new(0) };
         let base = tga([10, 20, 30, 255]);
         let encoded = delta("base", [3, 2, 1, 0]);
-        let key = completed_delta_key(
-            &crate::asset_cache::ContentCache::<DecodedImage>::key(&encoded),
-            &crate::asset_cache::ContentCache::<DecodedImage>::key(&base),
-        );
+        let key = crate::asset_cache::ContentCache::<CachedImage>::key(&encoded);
         for _ in 0..2 {
-            assert_eq!(decoder.decode(&encoded, &mut |_| Ok(base.clone())).unwrap().rgba, [11, 22, 29, 255]);
+            assert_eq!(decoder.decode(&encoded, &mut |_| Ok(base.clone())).unwrap().rgba.as_slice(), [11, 22, 29, 255]);
             assert!(decoder.cache.get(&key).is_none());
         }
     }
@@ -753,8 +791,8 @@ mod stream_tests {
         let mut decoder = ImageDecoder::default();
         let mut base = tga([10, 20, 30, 255]);
         let mut first = decoder.decode(&base, &mut |_| anyhow::bail!("no base")).unwrap();
-        first.rgba.fill(0);
-        assert_eq!(decoder.decode(&base, &mut |_| anyhow::bail!("no base")).unwrap().rgba, [10, 20, 30, 255]);
+        std::sync::Arc::make_mut(&mut first.rgba).fill(0);
+        assert_eq!(decoder.decode(&base, &mut |_| anyhow::bail!("no base")).unwrap().rgba.as_slice(), [10, 20, 30, 255]);
         let mut delta = vec![0; 0x38];
         delta[..4].copy_from_slice(b"PGD3");
         delta[8] = 1;
@@ -764,9 +802,9 @@ mod stream_tests {
         delta[0x30] = 5;
         delta[0x34] = 7;
         delta.extend([0, 5, 1, 0, 0, 0, 0]);
-        assert_eq!(decoder.decode(&delta, &mut |_| Ok(base.clone())).unwrap().rgba, [10, 20, 30, 255]);
+        assert_eq!(decoder.decode(&delta, &mut |_| Ok(base.clone())).unwrap().rgba.as_slice(), [10, 20, 30, 255]);
         base = tga([40, 50, 60, 255]);
-        assert_eq!(decoder.decode(&delta, &mut |_| Ok(base.clone())).unwrap().rgba, [40, 50, 60, 255]);
+        assert_eq!(decoder.decode(&delta, &mut |_| Ok(base.clone())).unwrap().rgba.as_slice(), [40, 50, 60, 255]);
     }
 
     #[test]

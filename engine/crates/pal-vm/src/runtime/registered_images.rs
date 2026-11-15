@@ -48,7 +48,7 @@ pub(super) fn load_sprite_resource(
                         cell_height: movie.height,
                         offset_x: 0,
                         offset_y: 0,
-                        rgba: movie.rgba,
+                        rgba: std::sync::Arc::new(movie.rgba),
                     };
                     return Ok((asset, image, Some(movie.handle)));
                 }

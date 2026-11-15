@@ -628,7 +628,7 @@ impl ScriptRuntime {
             for _ in 0..count {
                 rgba.extend_from_slice(&[r, g, b, a]);
             }
-            (info.texture_width, info.texture_height, rgba)
+            (info.texture_width, info.texture_height, std::sync::Arc::new(rgba))
         } else {
             let asset = open_resource_variant(resources, &name, IMAGE_EXTENSIONS).ok()?;
             let image = decode_asset_image(resources, &asset).ok()?;
@@ -664,7 +664,7 @@ impl ScriptRuntime {
             height,
             native_projection: None,
             center_scale: false,
-            rgba: Arc::new(rgba),
+            rgba,
             option_type: 0,
             option_backup: Vec::new(),
         })

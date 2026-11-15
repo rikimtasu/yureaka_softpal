@@ -461,7 +461,7 @@ impl ScriptRuntime {
                         },
                         None => icon.position[1],
                     };
-                    if let Some(handle) = sprites.create_rgba_sprite(
+                    if let Some(handle) = sprites.create_shared_rgba_sprite(
                         image.width,
                         image.height,
                         image.rgba,

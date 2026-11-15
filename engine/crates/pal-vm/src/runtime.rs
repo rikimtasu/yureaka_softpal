@@ -7862,7 +7862,7 @@ impl ScriptRuntime {
                 y: 0,
                 width: decoded.width,
                 height: decoded.height,
-                rgba: decoded.rgba,
+                rgba: decoded.rgba.to_vec(),
             }],
             decoded.width.max(1),
             decoded.height.max(1),
@@ -9321,7 +9321,7 @@ impl ScriptRuntime {
                     return ExtCallOutcome::Value(0);
                 }
             };
-            let surface = match SpriteSurface::rgba8(
+            let surface = match SpriteSurface::rgba8_shared(
                 surface_id,
                 1,
                 decoded.width,
@@ -10549,7 +10549,7 @@ impl ScriptRuntime {
             let clamp = |extent: i32| extent.clamp(1, 4096) as u32;
             let (width, height) = (clamp(width), clamp(height));
             let rgba = [r, g, b, a].repeat(width as usize * height as usize);
-            Some((width, height, rgba))
+            Some((width, height, std::sync::Arc::new(rgba)))
         } else {
             resource_manager.and_then(|resources| {
                 open_resource_variant(resources, &name, IMAGE_EXTENSIONS)
@@ -10565,7 +10565,7 @@ impl ScriptRuntime {
         let Some((width, height, rgba)) = image else {
             return ExtCallOutcome::Value(0);
         };
-        let Some(handle) = sprites.create_rgba_sprite(
+        let Some(handle) = sprites.create_shared_rgba_sprite(
             width,
             height,
             rgba,
@@ -10816,7 +10816,7 @@ impl ScriptRuntime {
             render_from_native_wrapper(initial_visual, logical_width, logical_height)
         };
         let surface_id = sprites.allocate_surface_id();
-        let surface = match SpriteSurface::rgba8(
+        let surface = match SpriteSurface::rgba8_shared(
             surface_id,
             1,
             decoded.width,
@@ -11076,7 +11076,7 @@ impl ScriptRuntime {
             render_from_native_wrapper(face_visual, logical_width, logical_height)
         };
         let surface_id = sprites.allocate_surface_id();
-        let surface = match SpriteSurface::rgba8(
+        let surface = match SpriteSurface::rgba8_shared(
             surface_id,
             1,
             decoded.width,
@@ -12616,7 +12616,7 @@ impl ScriptRuntime {
             }
         };
         let surface_id = sprites.allocate_surface_id();
-        let surface = match SpriteSurface::rgba8(
+        let surface = match SpriteSurface::rgba8_shared(
             surface_id,
             1,
             decoded.width,
@@ -12750,7 +12750,7 @@ impl ScriptRuntime {
                 }
             };
             let surface_id = sprites.allocate_surface_id();
-            let surface = match SpriteSurface::rgba8(
+            let surface = match SpriteSurface::rgba8_shared(
                 surface_id,
                 1,
                 decoded.width,
@@ -13308,7 +13308,7 @@ impl ScriptRuntime {
             render_from_native_wrapper(next_visual, logical_width, logical_height)
         };
         let surface_id = sprites.allocate_surface_id();
-        let surface = match SpriteSurface::rgba8(
+        let surface = match SpriteSurface::rgba8_shared(
             surface_id,
             1,
             decoded.width,
@@ -14022,7 +14022,7 @@ impl ScriptRuntime {
                     .and_then(|asset| self.decode_asset_image(resources, &asset));
                 match image {
                     Ok(image) => {
-                        if let Some(handle) = sprites.create_rgba_sprite(
+                        if let Some(handle) = sprites.create_shared_rgba_sprite(
                             image.width, image.height, image.rgba, info.position,
                             info.priority, info.source_name.clone(),
                         ) {
@@ -18423,7 +18423,7 @@ fn adv_text_base_panel(
     let pad_x = 24_u32;
     let pad_y = 18_u32;
     if let Some(base) = base_image {
-        let mut rgba = base.rgba;
+        let mut rgba = base.rgba.to_vec();
         let alpha = window_alpha.clamp(0, 255) as u8;
         if alpha < 255 {
             for px in rgba.chunks_exact_mut(4) {
@@ -20737,7 +20737,7 @@ mod tests {
             cell_height: 2,
             offset_x: 0,
             offset_y: 0,
-            rgba,
+            rgba: std::sync::Arc::new(rgba),
         };
         let (w, h, glyph) = wait_mark_frame(&sheet, 0, [10, 20, 30, 255]);
         assert_eq!((w, h), (2, 2));

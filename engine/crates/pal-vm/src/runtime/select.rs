@@ -787,7 +787,7 @@ impl ScriptRuntime {
             let height = image.cell_height;
             let surface = sprites.allocate_surface_id();
             if let Ok(surface_data) =
-                SpriteSurface::rgba8(surface, 1, image.width, image.height, image.rgba)
+                SpriteSurface::rgba8_shared(surface, 1, image.width, image.height, image.rgba)
             {
                 sprites.insert_surface(surface_data);
                 let mut desc =

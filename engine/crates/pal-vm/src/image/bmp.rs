@@ -82,7 +82,7 @@ pub(super) fn decode(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
         cell_height: height as u32,
         offset_x: 0,
         offset_y: 0,
-        rgba,
+        rgba: std::sync::Arc::new(rgba),
     })
 }
 
@@ -113,8 +113,7 @@ mod tests {
     #[test]
     fn palette_padding_orientation_and_reserved_alpha() {
         let bottom_up = decode(&bitmap(2)).unwrap();
-        assert_eq!(
-            bottom_up.rgba,
+        assert_eq!(bottom_up.rgba.as_slice(),
             [
                 60, 50, 40, 255, 30, 20, 10, 255, 60, 50, 40, 255, 30, 20, 10, 255, 60, 50, 40,
                 255, 30, 20, 10, 255

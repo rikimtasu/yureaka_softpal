@@ -53,7 +53,7 @@ pub(super) fn decode(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
         cell_height: u32::from(info.height),
         offset_x: 0,
         offset_y: 0,
-        rgba,
+        rgba: std::sync::Arc::new(rgba),
     })
 }
 

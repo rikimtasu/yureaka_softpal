@@ -2634,6 +2634,46 @@ impl SpriteSurface {
         })
     }
 
+    /// Zero-copy counterpart to `rgba8` for cache-shared pixel buffers
+    /// (`DecodedImage::rgba`). In-place edits already detach via
+    /// `pixels_mut` (`Arc::make_mut`), so sharing is safe.
+    pub fn rgba8_shared(
+        id: SpriteSurfaceId,
+        generation: u64,
+        width: u32,
+        height: u32,
+        pixels: Arc<Vec<u8>>,
+    ) -> anyhow::Result<Self> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("RGBA sprite dimensions overflow: {width}x{height}"))?;
+        if expected == 0 {
+            anyhow::bail!("RGBA sprite dimensions must be nonzero: {width}x{height}");
+        }
+        if pixels.len() != expected {
+            anyhow::bail!(
+                "RGBA sprite surface {:?} has {} bytes, expected {} for {}x{}",
+                id,
+                pixels.len(),
+                expected,
+                width,
+                height
+            );
+        }
+        Ok(Self {
+            id,
+            texture_id: SceneTextureId(id.0),
+            generation,
+            width,
+            height,
+            format: SceneTextureFormat::Rgba8,
+            pixels,
+            dirty: false,
+            hires: None,
+        })
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }

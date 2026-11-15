@@ -57,6 +57,30 @@ pub fn file_len(path: &Path) -> Result<usize> {
     })
 }
 
+/// Identity used to validate a cached open. On host targets this is
+/// (length, mtime); on the wasm VFS there is no mtime, so the length alone
+/// is used. Callers must treat this as a best-effort freshness check, not a
+/// content hash: if a file is replaced between the read and the identity
+/// read, one stale (pre-replacement) entry can be served until the file is
+/// touched again. This matches the existing engine contract: `PacArchive`
+/// already pins its entry table at `from_file` time, so a repacked archive
+/// is not picked up mid-run either.
+pub fn file_identity(path: &Path) -> Result<(u64, std::time::SystemTime)> {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        let metadata = native_fs::metadata(path).map_err(|e| AssetError::io(path, e))?;
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        Ok((metadata.len(), modified))
+    }
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let len = file_len(path)? as u64;
+        Ok((len, std::time::SystemTime::UNIX_EPOCH))
+    }
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn read_all(path: &Path) -> Result<Vec<u8>> {
     native_fs::read(path).map_err(|e| AssetError::io(path, e))
