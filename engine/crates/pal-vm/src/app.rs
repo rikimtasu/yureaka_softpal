@@ -730,16 +730,25 @@ impl SenaApplication {
             }
         };
         self.apply_window_requests();
-        let Some(renderer) = self.renderer.as_mut() else {
-            self.engine.input_begin_frame();
-            return;
-        };
-        match renderer.render(&frame.scene) {
-            RenderOutcome::Rendered => {}
-            RenderOutcome::Skipped => {}
-            RenderOutcome::Reconfigured => log::debug!("software surface was reconfigured"),
+        if let Some(renderer) = self.renderer.as_mut() {
+            match renderer.render(&frame.scene) {
+                RenderOutcome::Rendered => {}
+                RenderOutcome::Skipped => {}
+                RenderOutcome::Reconfigured => log::debug!("software surface was reconfigured"),
+            }
         }
         self.engine.input_begin_frame();
+        // The script's game-end path halts the runtime instead of asking the
+        // host to close; a native PAL build then exits. Mirror that here so the
+        // process does not outlive its window.
+        if runtime_status_is_terminal(&frame.runtime_status) {
+            log::info!(
+                "sena runtime reached a terminal status ({}); exiting",
+                frame.runtime_status
+            );
+            self.engine.shutdown();
+            event_loop.exit();
+        }
     }
 
     fn render_window_diagnostic_batch(&mut self, event_loop: &ActiveEventLoop) {
